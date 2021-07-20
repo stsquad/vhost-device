@@ -1,0 +1,26 @@
+[package]
+name = "vhost-device-scsi"
+version = "0.1.0"
+authors = ["Gaelan Steele <gbs@canishe.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.1",  features = ["derive"] }
+env_logger = "0.10"
+epoll = "4.3"
+log = "0.4"
+num_enum = "0.5"
+thiserror = "1.0"
+vhost = { version = "0.6", features = ["vhost-user-slave"] }
+vhost-user-backend = "0.8"
+# until the scsi bindings hit a release, we have to use the commit that adds them as rev.
+virtio-bindings = { git = "https://github.com/rust-vmm/vm-virtio", rev = "467c8ec99375a5f4e08b85b18257cd7e0bac1dc0" }
+virtio-queue = "0.7"
+vm-memory = "0.10"
+vmm-sys-util = "0.11"
+
+[dev-dependencies]
+tempfile = "3.2.0"
+
