@@ -1,5 +1,4 @@
 use super::{
-    packet::*,
     rxops::*,
     rxqueue::*,
     txbuf::*,
@@ -12,10 +11,12 @@ use super::{
 };
 use log::info;
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     num::Wrapping,
     os::unix::prelude::{AsRawFd, RawFd},
 };
+use virtio_vsock::packet::VsockPacket;
+use vm_memory::{Bytes, VolatileSlice, bitmap::BitmapSlice};
 
 #[derive(Debug)]
 pub struct VsockConnection<S> {
@@ -117,7 +118,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
     /// Process a vsock packet that is meant for this connection.
     /// Forward data to the host-side application if the vsock packet
     /// contains a RW operation.
-    pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()> {
+    pub(crate) fn recv_pkt<B: BitmapSlice>(&mut self, pkt: &mut VsockPacket<B>)
+         -> Result<()> {
         // Initialize all fields in the packet header
         self.init_pkt(pkt);
 
@@ -141,7 +143,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
                     pkt.set_op(VSOCK_OP_CREDIT_REQUEST);
                     return Ok(());
                 }
-                let buf = pkt.buf_mut().ok_or(Error::PktBufMissing)?;
+
+                let buf = pkt.data().ok_or(Error::PktBufMissing)?;
 
                 // Perform a credit check to find the maximum read size. The read
                 // data must fit inside a packet buffer and be within peer's
@@ -149,7 +152,7 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
                 let max_read_len = std::cmp::min(buf.len(), self.peer_avail_credit());
 
                 // Read data from the stream directly into the buffer
-                if let Ok(read_cnt) = self.stream.read(&mut buf[..max_read_len]) {
+                if let Ok(read_cnt) = buf.read_from(0, &mut self.stream, max_read_len) {
                     if read_cnt == 0 {
                         // If no data was read then the stream was closed down unexpectedly.
                         // Send a shutdown packet to the guest-side application.
@@ -198,7 +201,9 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
     ///
     /// Returns:
     /// - always `Ok(())` to indicate that the packet has been consumed
-    pub(crate) fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+    pub(crate) fn send_pkt<B: BitmapSlice>
+        (&mut self, pkt:  &VsockPacket<B>) -> Result<()>
+    {
         // Update peer credit information
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
@@ -213,19 +218,21 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
             }
             VSOCK_OP_RW => {
                 // Data has to be written to the host-side stream
-                if pkt.buf().is_none() {
-                    info!(
-                        "Dropping empty packet from guest (lp={}, pp={})",
-                        self.local_port, self.peer_port
-                    );
-                    return Ok(());
-                }
-
-                let buf_slice = &pkt.buf().unwrap()[..(pkt.len() as usize)];
-                if let Err(err) = self.send_bytes(buf_slice) {
-                    // TODO: Terminate this connection
-                    dbg!("err:{:?}", err);
-                    return Ok(());
+                match pkt.data() {
+                    None => {
+                        info!(
+                            "Dropping empty packet from guest (lp={}, pp={})",
+                            self.local_port, self.peer_port
+                        );
+                        return Ok(());
+                    }
+                    Some(buf) => {
+                        if let Err(err) = self.send_bytes(buf) {
+                            // TODO: Terminate this connection
+                            dbg!("err:{:?}", err);
+                            return Ok(());
+                        }
+                    }
                 }
             }
             VSOCK_OP_CREDIT_UPDATE => {
@@ -271,7 +278,7 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
     /// Returns:
     /// - Ok(cnt) where cnt is the number of bytes written to the stream
     /// - Err(Error::UnixWrite) if there was an error writing to the stream
-    fn send_bytes(&mut self, buf: &[u8]) -> Result<()> {
+    fn send_bytes<B: BitmapSlice>(&mut self, buf: &VolatileSlice<B>) -> Result<()> {
         if !self.tx_buf.is_empty() {
             // Data is already present in the buffer and the backend
             // is waiting for a EPOLLOUT event to flush it
@@ -279,15 +286,15 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
         }
 
         // Write data to the stream
-        let written_count = match self.stream.write(buf) {
+
+        let written_count = match buf.write_to(0, &mut self.stream, buf.len()) {
             Ok(cnt) => cnt,
             Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    0
-                } else {
-                    println!("send_bytes error: {:?}", e);
-                    return Err(Error::UnixWrite);
-                }
+                // if e.kind() == ErrorKind::WouldBlock {
+                //     0
+                // } else {
+                println!("send_bytes error: {:?}", e);
+                return Err(Error::UnixWrite);
             }
         };
 
@@ -297,18 +304,21 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
         self.rx_queue.enqueue(RxOps::CreditUpdate);
 
         if written_count != buf.len() {
-            return self.tx_buf.push(&buf[written_count..]);
+            return self.tx_buf.push(buf);
         }
 
         Ok(())
     }
 
     /// Initialize all header fields in the vsock packet.
-    fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
+    fn init_pkt<'a, 'b, B: BitmapSlice>
+        (&self, pkt: &'a mut VsockPacket<'b, B>) ->
+        &'a mut VsockPacket<'b, B>
+    {
         // Zero out the packet header
-        for b in pkt.hdr_mut() {
-            *b = 0;
-        }
+        // for b in pkt.hdr_mut() {
+        //     *b = 0;
+        // }
 
         pkt.set_src_cid(self.local_cid)
             .set_dst_cid(self.guest_cid)

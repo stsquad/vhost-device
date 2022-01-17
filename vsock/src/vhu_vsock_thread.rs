@@ -1,5 +1,4 @@
 use super::{
-    packet::*,
     rxops::*,
     thread_backend::*,
     vhu_vsock::{ConnMapKey, Error, Result, VhostUserVsockBackend, BACKEND_EVENT, VSOCK_HOST_CID},
@@ -16,14 +15,16 @@ use std::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
+    ops::Deref,
     sync::{Arc, RwLock},
 };
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
-use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+use vm_memory::{GuestAddressSpace, GuestMemoryAtomic, GuestMemoryMmap};
 use vmm_sys_util::{
     epoll::EventSet,
     eventfd::{EventFd, EFD_NONBLOCK},
 };
+use virtio_vsock::packet::VsockPacket;
 
 type ArcVhostBknd = Arc<RwLock<VhostUserVsockBackend>>;
 
@@ -376,14 +377,15 @@ impl VhostUserVsockThread {
 
         while let Some(mut avail_desc) = queue.iter().map_err(|_| Error::IterateQueue)?.next() {
             used_any = true;
-            let atomic_mem = atomic_mem.clone();
-
             let head_idx = avail_desc.head_index();
+            let mem = atomic_mem.clone().memory();
+
             let used_len =
-                match VsockPacket::from_rx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
+                match VsockPacket::from_rx_virtq_chain(mem.deref(), &mut avail_desc) {
                     Ok(mut pkt) => {
-                        if self.thread_backend.recv_pkt(&mut pkt).is_ok() {
-                            pkt.hdr().len() + pkt.len() as usize
+                        let res = self.thread_backend.recv_pkt(&mut pkt);
+                        if res.is_ok() {
+                            pkt.header().len() + pkt.len() as usize
                         } else {
                             queue.iter().unwrap().go_to_previous_position();
                             break;
@@ -476,10 +478,10 @@ impl VhostUserVsockThread {
             .next()
         {
             used_any = true;
-            let atomic_mem = atomic_mem.clone();
-
             let head_idx = avail_desc.head_index();
-            let pkt = match VsockPacket::from_tx_virtq_head(&mut avail_desc, atomic_mem.clone()) {
+            let mem = atomic_mem.clone().memory();
+
+            let pkt = match VsockPacket::from_tx_virtq_chain(mem.deref(), &mut avail_desc) {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     dbg!("vsock: error reading TX packet: {:?}", e);
