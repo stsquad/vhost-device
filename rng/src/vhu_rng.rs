@@ -19,7 +19,7 @@ use virtio_bindings::bindings::virtio_net::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_V
 use virtio_bindings::bindings::virtio_ring::{
     VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC,
 };
-use virtio_queue::{DescriptorChain, QueueOwnedT};
+use virtio_queue::{DescriptorChain, QueueT};
 use vm_memory::{
     Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryLoadGuard, GuestMemoryMmap,
 };
@@ -110,96 +110,95 @@ impl<T: Read> VuRngBackend<T> {
 
     pub fn process_requests(
         &mut self,
-        requests: Vec<RngDescriptorChain>,
+        desc_chain: RngDescriptorChain,
         vring: &VringRwLock,
     ) -> Result<bool> {
-        if requests.is_empty() {
-            return Ok(true);
+
+        let descriptors: Vec<_> = desc_chain.clone().collect();
+
+        if descriptors.len() != 1 {
+            return Err(VuRngError::UnexpectedDescriptorCount(descriptors.len()));
         }
 
-        for desc_chain in requests {
-            let descriptors: Vec<_> = desc_chain.clone().collect();
+        let descriptor = descriptors[0];
+        let mut to_read = descriptor.len() as usize;
+        let mut timer = &mut self.timer;
 
-            if descriptors.len() != 1 {
-                return Err(VuRngError::UnexpectedDescriptorCount(descriptors.len()));
-            }
+        if !descriptor.is_write_only() {
+            return Err(VuRngError::UnexpectedReadDescriptor);
+        }
 
-            let descriptor = descriptors[0];
-            let mut to_read = descriptor.len() as usize;
-            let mut timer = &mut self.timer;
+        // Get the current time
+        let now = Instant::now();
 
-            if !descriptor.is_write_only() {
-                return Err(VuRngError::UnexpectedReadDescriptor);
-            }
+        // Check how much time has passed since we started the last period.
+        match now.checked_duration_since(timer.period_start) {
+            Some(duration) => {
+                let elapsed = duration.as_millis();
 
-            // Get the current time
-            let now = Instant::now();
+                if elapsed >= timer.period_ms {
+                    // More time has passed than a full period, reset time
+                    // and quota.
+                    timer.period_start = now;
+                    timer.quota_remaining = timer.max_bytes;
+                } else {
+                    // If we are out of bytes for the current period.  Block until
+                    // the start of the next period.
+                    if timer.quota_remaining == 0 {
+                        let to_sleep = timer.period_ms - elapsed;
 
-            // Check how much time has passed since we started the last period.
-            match now.checked_duration_since(timer.period_start) {
-                Some(duration) => {
-                    let elapsed = duration.as_millis();
-
-                    if elapsed >= timer.period_ms {
-                        // More time has passed than a full period, reset time
-                        // and quota.
-                        timer.period_start = now;
+                        sleep(Duration::from_millis(to_sleep as u64));
+                        timer.period_start = Instant::now();
                         timer.quota_remaining = timer.max_bytes;
-                    } else {
-                        // If we are out of bytes for the current period.  Block until
-                        // the start of the next period.
-                        if timer.quota_remaining == 0 {
-                            let to_sleep = timer.period_ms - elapsed;
-
-                            sleep(Duration::from_millis(to_sleep as u64));
-                            timer.period_start = Instant::now();
-                            timer.quota_remaining = timer.max_bytes;
-                        }
                     }
                 }
-                None => return Err(VuRngError::UnexpectedTimerValue),
-            };
-
-            if timer.quota_remaining < to_read {
-                to_read = timer.quota_remaining;
             }
+            None => return Err(VuRngError::UnexpectedTimerValue),
+        };
 
-            let mut rng_source = self
-                .rng_source
-                .lock()
-                .map_err(|_| VuRngError::UnexpectedRngSourceAccessError)?;
-
-            let len = desc_chain
-                .memory()
-                .read_from(descriptor.addr(), &mut *rng_source, to_read as usize)
-                .map_err(|_| VuRngError::UnexpectedRngSourceError)?;
-
-            timer.quota_remaining -= len;
-
-            if vring.add_used(desc_chain.head_index(), len as u32).is_err() {
-                warn!("Couldn't return used descriptors to the ring");
-            }
+        if timer.quota_remaining < to_read {
+            to_read = timer.quota_remaining;
         }
+
+        let mut rng_source = self
+            .rng_source
+            .lock()
+            .map_err(|_| VuRngError::UnexpectedRngSourceAccessError)?;
+
+        let len = desc_chain
+            .memory()
+            .read_from(descriptor.addr(), &mut *rng_source, to_read as usize)
+            .map_err(|_| VuRngError::UnexpectedRngSourceError)?;
+
+        if vring.add_used(desc_chain.head_index(), len as u32).is_err() {
+            warn!("Couldn't return used descriptors to the ring");
+        }
+
+        timer.quota_remaining -= len;
+
         Ok(true)
     }
 
     /// Process the requests in the vring and dispatch replies
     fn process_queue(&mut self, vring: &VringRwLock) -> Result<bool> {
-        let requests: Vec<_> = vring
-            .get_mut()
-            .get_queue_mut()
-            .iter(self.mem.as_ref().unwrap().memory())
-            .map_err(|_| VuRngError::DescriptorNotFound)?
-            .collect();
-
-        if self.process_requests(requests, vring)? {
-            // Send notification once all the requests are processed
-            vring
-                .signal_used_queue()
-                .map_err(|_| VuRngError::SendNotificationFailed)?;
+        let mut guard = vring.get_mut();
+        let queue = guard.get_queue_mut();
+        let mem = self.mem.as_ref().unwrap().memory();
+        match queue.pop_descriptor_chain(mem.clone()) {
+            Some(desc_chain) =>
+            {
+                self.process_requests(desc_chain, vring)?;
+                // Send notification once all the requests are processed
+                vring
+                    .signal_used_queue()
+                    .map_err(|_| VuRngError::SendNotificationFailed)?;
+                Ok(true)
+            }
+            None =>
+            {
+                Err(VuRngError::DescriptorNotFound)
+            }
         }
-
-        Ok(true)
     }
 }
 
