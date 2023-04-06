@@ -47,16 +47,28 @@ struct GpioArgs {
     #[clap(short = 'c', long, default_value_t = 1)]
     socket_count: usize,
 
-    /// List of GPIO devices, one for each guest, in the format <N1>[:<N2>]. The first entry is for
-    /// Guest that connects to socket 0, next one for socket 1, and so on. Each device number here
-    /// will be used to access the corresponding /dev/gpiochipX. Example, "-c 4 -l 3:4:6:1"
+    /// List of GPIO devices, one for each guest, in the format
+    /// <N1>[:<N2>]. The first entry is for Guest that connects to
+    /// socket 0, next one for socket 1, and so on. Each device number
+    /// here will be used to access the corresponding /dev/gpiochipX.
+    /// or simulate a GPIO device with N pins. Example, "-c 4 -l
+    /// 3:s4:6:s1"
     #[clap(short = 'l', long)]
     device_list: String,
 }
 
+type GpioChipID = u32;
+type NumGpios = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GpioDeviceConfig {
+    PhysicalDevice(GpioChipID),
+    SimulatedDevice(NumGpios),
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) struct DeviceConfig {
-    inner: Vec<u32>,
+    inner: Vec<GpioDeviceConfig>,
 }
 
 impl DeviceConfig {
@@ -64,13 +76,15 @@ impl DeviceConfig {
         Self { inner: Vec::new() }
     }
 
-    fn contains_device(&self, number: u32) -> bool {
-        self.inner.iter().any(|elem| *elem == number)
+    fn contains_device(&self, device: GpioDeviceConfig) -> bool {
+        self.inner.contains(&device)
     }
 
-    fn push(&mut self, device: u32) -> Result<()> {
-        if self.contains_device(device) {
-            return Err(Error::DeviceDuplicate(device));
+    fn push(&mut self, device: GpioDeviceConfig) -> Result<()> {
+        if let GpioDeviceConfig::PhysicalDevice(id) = device {
+            if self.contains_device(device) {
+                return Err(Error::DeviceDuplicate(id));
+            }
         }
 
         self.inner.push(device);
@@ -86,8 +100,16 @@ impl TryFrom<&str> for DeviceConfig {
         let mut devices = DeviceConfig::new();
 
         for info in list.iter() {
-            let number = info.parse::<u32>().map_err(Error::ParseFailure)?;
-            devices.push(number)?;
+            devices.push(match info.strip_prefix('s') {
+                Some(num) => {
+                    let num_gpios = num.parse::<u32>().map_err(Error::ParseFailure)?;
+                    GpioDeviceConfig::SimulatedDevice(num_gpios)
+                }
+                _ => {
+                    let devid = info.parse::<u32>().map_err(Error::ParseFailure)?;
+                    GpioDeviceConfig::PhysicalDevice(devid)
+                }
+            })?;
         }
         Ok(devices)
     }
@@ -131,7 +153,7 @@ fn start_backend<D: 'static + GpioDevice + Send + Sync>(args: GpioArgs) -> Resul
 
     for i in 0..config.socket_count {
         let socket = config.socket_path.to_owned() + &i.to_string();
-        let device_num = config.devices.inner[i];
+        let cfg = config.devices.inner[i];
 
         let handle = spawn(move || loop {
             // A separate thread is spawned for each socket and can connect to a separate guest.
@@ -142,8 +164,16 @@ fn start_backend<D: 'static + GpioDevice + Send + Sync>(args: GpioArgs) -> Resul
             // threads, and so the code uses unwrap() instead. The panic on a thread won't cause
             // trouble to other threads/guests or the main() function and should be safe for the
             // daemon.
-            let device = D::open(device_num).unwrap();
-            let controller = GpioController::<D>::new(device).unwrap();
+            let controller = match cfg {
+                GpioDeviceConfig::PhysicalDevice(device_num) => {
+                    let device = D::open(device_num).unwrap();
+                    GpioController::<D>::new(device).unwrap()
+                }
+                _ => {
+                    break;
+                }
+            };
+
             let backend = Arc::new(RwLock::new(VhostUserGpioBackend::new(controller).unwrap()));
             let listener = Listener::new(socket.clone(), true).unwrap();
 
@@ -197,7 +227,13 @@ mod tests {
 
     impl DeviceConfig {
         pub fn new_with(devices: Vec<u32>) -> Self {
-            DeviceConfig { inner: devices }
+            let gpio_devices: Vec<GpioDeviceConfig> = devices
+                .into_iter()
+                .map(GpioDeviceConfig::PhysicalDevice)
+                .collect();
+            DeviceConfig {
+                inner: gpio_devices,
+            }
         }
     }
 
@@ -213,10 +249,15 @@ mod tests {
     fn test_gpio_device_config() {
         let mut config = DeviceConfig::new();
 
-        config.push(5).unwrap();
-        config.push(6).unwrap();
+        config.push(GpioDeviceConfig::PhysicalDevice(5)).unwrap();
+        config.push(GpioDeviceConfig::PhysicalDevice(6)).unwrap();
 
-        assert_eq!(config.push(5).unwrap_err(), Error::DeviceDuplicate(5));
+        assert_eq!(
+            config
+                .push(GpioDeviceConfig::PhysicalDevice(5))
+                .unwrap_err(),
+            Error::DeviceDuplicate(5)
+        );
     }
 
     #[test]
