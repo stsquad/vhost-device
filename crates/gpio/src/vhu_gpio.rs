@@ -505,7 +505,7 @@ mod tests {
 
     use super::Error;
     use super::*;
-    use crate::gpio::tests::DummyDevice;
+    use crate::gpio::DummyDevice;
     use crate::gpio::Error as GpioError;
     use crate::gpio::*;
 

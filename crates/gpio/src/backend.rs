@@ -193,7 +193,7 @@ pub(crate) fn gpio_init() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpio::tests::DummyDevice;
+    use crate::gpio::DummyDevice;
 
     impl DeviceConfig {
         pub fn new_with(devices: Vec<u32>) -> Self {
