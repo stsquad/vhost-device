@@ -16,7 +16,7 @@ use vhost::{vhost_user, vhost_user::Listener};
 use vhost_user_backend::VhostUserDaemon;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
-use crate::gpio::{GpioController, GpioDevice, PhysDevice};
+use crate::gpio::{DummyDevice, GpioController, GpioDevice, PhysDevice};
 use crate::vhu_gpio::VhostUserGpioBackend;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
@@ -147,7 +147,36 @@ impl TryFrom<GpioArgs> for GpioConfiguration {
     }
 }
 
-fn start_backend<D: 'static + GpioDevice + Send + Sync>(args: GpioArgs) -> Result<()> {
+fn start_device_backend<D: GpioDevice>(device: D, socket: String) {
+    let controller = GpioController::<D>::new(device).unwrap();
+    let backend = Arc::new(RwLock::new(VhostUserGpioBackend::new(controller).unwrap()));
+    let listener = Listener::new(socket, true).unwrap();
+
+    let mut daemon = VhostUserDaemon::new(
+        String::from("vhost-device-gpio-backend"),
+        backend.clone(),
+        GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+    )
+    .unwrap();
+
+    daemon.start(listener).unwrap();
+
+    match daemon.wait() {
+        Ok(()) => {
+            info!("Stopping cleanly.");
+        }
+        Err(vhost_user_backend::Error::HandleRequest(vhost_user::Error::PartialMessage)) => {
+            info!("vhost-user connection closed with partial message. If the VM is shutting down, this is expected behavior; otherwise, it might be a bug.");
+        }
+        Err(e) => {
+            warn!("Error running daemon: {:?}", e);
+        }
+    }
+    // No matter the result, we need to shut down the worker thread.
+    backend.read().unwrap().exit_event.write(1).unwrap();
+}
+
+fn start_backend(args: GpioArgs) -> Result<()> {
     let config = GpioConfiguration::try_from(args).unwrap();
     let mut handles = Vec::new();
 
@@ -164,44 +193,24 @@ fn start_backend<D: 'static + GpioDevice + Send + Sync>(args: GpioArgs) -> Resul
             // threads, and so the code uses unwrap() instead. The panic on a thread won't cause
             // trouble to other threads/guests or the main() function and should be safe for the
             // daemon.
-            let controller = match cfg {
+            // A separate thread is spawned for each socket and can connect to a separate guest.
+            // These are run in an infinite loop to not require the daemon to be restarted once a
+            // guest exits.
+            //
+            // There isn't much value in complicating code here to return an error from the
+            // threads, and so the code uses unwrap() instead. The panic on a thread won't cause
+            // trouble to other threads/guests or the main() function and should be safe for the
+            // daemon.
+            match cfg {
                 GpioDeviceConfig::PhysicalDevice(device_num) => {
-                    let device = D::open(device_num).unwrap();
-                    GpioController::<D>::new(device).unwrap()
+                    let controller = PhysDevice::open(device_num).unwrap();
+                    start_device_backend(controller, socket.clone());
                 }
-                _ => {
-                    break;
+                GpioDeviceConfig::SimulatedDevice(num_gpios) => {
+                    let controller = DummyDevice::open(num_gpios).unwrap();
+                    start_device_backend(controller, socket.clone());
                 }
             };
-
-            let backend = Arc::new(RwLock::new(VhostUserGpioBackend::new(controller).unwrap()));
-            let listener = Listener::new(socket.clone(), true).unwrap();
-
-            let mut daemon = VhostUserDaemon::new(
-                String::from("vhost-device-gpio-backend"),
-                backend.clone(),
-                GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-            )
-            .unwrap();
-
-            daemon.start(listener).unwrap();
-
-            match daemon.wait() {
-                Ok(()) => {
-                    info!("Stopping cleanly.");
-                }
-                Err(vhost_user_backend::Error::HandleRequest(
-                    vhost_user::Error::PartialMessage,
-                )) => {
-                    info!("vhost-user connection closed with partial message. If the VM is shutting down, this is expected behavior; otherwise, it might be a bug.");
-                }
-                Err(e) => {
-                    warn!("Error running daemon: {:?}", e);
-                }
-            }
-
-            // No matter the result, we need to shut down the worker thread.
-            backend.read().unwrap().exit_event.write(1).unwrap();
         });
 
         handles.push(handle);
@@ -217,13 +226,12 @@ fn start_backend<D: 'static + GpioDevice + Send + Sync>(args: GpioArgs) -> Resul
 pub(crate) fn gpio_init() -> Result<()> {
     env_logger::init();
 
-    start_backend::<PhysDevice>(GpioArgs::parse())
+    start_backend(GpioArgs::parse())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpio::DummyDevice;
 
     impl DeviceConfig {
         pub fn new_with(devices: Vec<u32>) -> Self {
@@ -315,10 +323,10 @@ mod tests {
     fn test_gpio_fail_listener() {
         // This will fail the listeners and thread will panic.
         let socket_name = "~/path/not/present/gpio";
-        let cmd_args = get_cmd_args(socket_name, "1:4:3:5", 4);
+        let cmd_args = get_cmd_args(socket_name, "s1:s4:s3:s5", 4);
 
         assert_eq!(
-            start_backend::<DummyDevice>(cmd_args).unwrap_err(),
+            start_backend(cmd_args).unwrap_err(),
             Error::FailedJoiningThreads
         );
     }
