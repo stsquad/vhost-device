@@ -413,11 +413,11 @@ impl DummyDevice {
 }
 
 impl GpioDevice for DummyDevice {
-    fn open(_device: u32) -> Result<Self>
+    fn open(ngpios: u32) -> Result<Self>
     where
         Self: Sized,
     {
-        Ok(DummyDevice::new(8))
+        Ok(DummyDevice::new(ngpios.try_into().unwrap()))
     }
 
     fn num_gpios(&self) -> Result<u16> {
