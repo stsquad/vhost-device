@@ -389,9 +389,14 @@ pub(crate) struct DummyDevice {
 
 impl DummyDevice {
     pub(crate) fn new(ngpio: u16) -> Self {
+        let mut gpio_names = Vec::with_capacity(ngpio.into());
+        for i in 0..ngpio {
+            gpio_names.push(format!("dummy{}", i));
+        }
+
         Self {
             ngpio,
-            gpio_names: vec!['\0'.to_string(); ngpio.into()],
+            gpio_names,
             state: RwLock::new(vec![
                 GpioState {
                     dir: VIRTIO_GPIO_DIRECTION_NONE,
