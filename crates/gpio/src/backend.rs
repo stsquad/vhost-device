@@ -36,8 +36,29 @@ pub(crate) enum Error {
     FailedJoiningThreads,
 }
 
+#[cfg(feature = "dummy")]
+macro_rules! gpio_after_help {
+    () => {
+        concat!(
+            "Each device number here will be used to access the corresponding /dev/gpiochipX",
+            "or simulate a GPIO device with N pins.",
+            " Example, \"-c 4 -l 3:s4:6:s1\"\n",
+        )
+    };
+}
+
+#[cfg(not(feature = "dummy"))]
+macro_rules! gpio_after_help {
+    () => {
+        concat!(
+            "Each device number here will be used to access the corresponding /dev/gpiochipX.",
+            " Example, \"-c 4 -l 3:4:6:1\"\n",
+        )
+    };
+}
+
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
+#[clap(author, version, about, long_about = None, after_help = gpio_after_help!())]
 struct GpioArgs {
     /// Location of vhost-user Unix domain socket. This is suffixed by 0,1,2..socket_count-1.
     #[clap(short, long)]
@@ -48,11 +69,14 @@ struct GpioArgs {
     socket_count: usize,
 
     /// List of GPIO devices, one for each guest, in the format
-    /// <N1>[:<N2>]. The first entry is for Guest that connects to
-    /// socket 0, next one for socket 1, and so on. Each device number
-    /// here will be used to access the corresponding /dev/gpiochipX.
-    /// or simulate a GPIO device with N pins. Example, "-c 4 -l
-    /// 3:s4:6:s1"
+    /// [s]<N1>[:[s]<N2>].
+    #[cfg(feature = "dummy")]
+    #[clap(short = 'l', long)]
+    device_list: String,
+
+    /// List of GPIO devices, one for each guest, in the format
+    /// <N1>[:<N2>].
+    #[cfg(not(feature = "dummy"))]
     #[clap(short = 'l', long)]
     device_list: String,
 }
@@ -60,6 +84,7 @@ struct GpioArgs {
 type GpioChipID = u32;
 type NumGpios = u32;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum GpioDeviceConfig {
     PhysicalDevice(GpioChipID),
@@ -100,6 +125,7 @@ impl TryFrom<&str> for DeviceConfig {
         let mut devices = DeviceConfig::new();
 
         for info in list.iter() {
+            #[cfg(feature = "dummy")]
             devices.push(match info.strip_prefix('s') {
                 Some(num) => {
                     let num_gpios = num.parse::<u32>().map_err(Error::ParseFailure)?;
@@ -110,6 +136,11 @@ impl TryFrom<&str> for DeviceConfig {
                     GpioDeviceConfig::PhysicalDevice(devid)
                 }
             })?;
+            #[cfg(not(feature = "dummy"))]
+            {
+                let devid = info.parse::<u32>().map_err(Error::ParseFailure)?;
+                devices.push(GpioDeviceConfig::PhysicalDevice(devid))?;
+            }
         }
         Ok(devices)
     }
@@ -206,9 +237,14 @@ fn start_backend(args: GpioArgs) -> Result<()> {
                     let controller = PhysDevice::open(device_num).unwrap();
                     start_device_backend(controller, socket.clone());
                 }
+                #[cfg(feature = "dummy")]
                 GpioDeviceConfig::SimulatedDevice(num_gpios) => {
                     let controller = DummyDevice::open(num_gpios).unwrap();
                     start_device_backend(controller, socket.clone());
+                }
+                #[cfg(not(feature = "dummy"))]
+                GpioDeviceConfig::SimulatedDevice(_num_gpios) => {
+                    break;
                 }
             };
         });

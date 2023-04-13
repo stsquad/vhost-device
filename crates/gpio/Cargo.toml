@@ -1,3 +1,5 @@
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [package]
 name = "vhost-device-gpio"
 version = "0.1.0"
@@ -9,7 +11,10 @@ keywords = ["gpio", "vhost", "virt", "backend"]
 license = "Apache-2.0 OR BSD-3-Clause"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["dummy"]
+# Allow user to instantiate dummy simulated GPIO device
+dummy = []
 
 [dependencies]
 clap = { version = "4.1",  features = ["derive"] }
