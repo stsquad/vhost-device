@@ -5,7 +5,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
-use log::error;
+use log::{error, info};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -585,6 +585,11 @@ impl<D: GpioDevice> GpioController<D> {
 
         self.device.set_direction(gpio, dir as u8, value as u32)?;
         state.dir = dir as u8;
+        info!(
+            "gpio {} set direction to {}",
+            self.device.gpio_name(gpio).unwrap(),
+            dir
+        );
         Ok(())
     }
 
@@ -599,6 +604,11 @@ impl<D: GpioDevice> GpioController<D> {
 
         self.device.set_value(gpio, value)?;
         self.state[gpio as usize].write().unwrap().val = Some(value as u16);
+        info!(
+            "gpio {} set value to {}",
+            self.device.gpio_name(gpio).unwrap(),
+            value
+        );
         Ok(())
     }
 
@@ -630,6 +640,11 @@ impl<D: GpioDevice> GpioController<D> {
 
         self.device.set_irq_type(gpio, irq_type)?;
         state.irq_type = irq_type;
+        info!(
+            "gpio {} set irq type to {}",
+            self.device.gpio_name(gpio).unwrap(),
+            irq_type
+        );
         Ok(())
     }
 
