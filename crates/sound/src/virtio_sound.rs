@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
-#![allow(dead_code)] //TODO: remove
-
 use vm_memory::{ByteValued, Le32, Le64};
 
 // virtqueues
@@ -48,8 +46,8 @@ pub const VIRTIO_SND_S_IO_ERR: u32 = 0x8003;
 
 // device data flow directions
 
-pub const VIRTIO_SND_D_OUTPUT: u8 = 0;
-pub const VIRTIO_SND_D_INPUT: u8 = 1;
+pub const VIRTIO_SND_D_OUTPUT: u32 = 0;
+pub const VIRTIO_SND_D_INPUT: u32 = 1;
 
 // supported jack features
 
